@@ -116,3 +116,51 @@ class LeAF(nn.Module):
             return emb, preds, curve_pred
         else:
             return emb, preds
+
+
+class Decoder(nn.Module):
+    def __init__(self, hidden_size, out_dim=1, expansion=2, dropout=0.1, vmin=0.0, vmax=1.0):
+        super().__init__()
+        self.vmin = vmin
+        self.vmax = vmax
+        self.norm = nn.LayerNorm(hidden_size)
+        self.fc1 = nn.Linear(hidden_size, hidden_size * expansion)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_size * expansion, ope_dim)
+
+    def forward(self, z):
+        # z: (B, T, hidden_size)
+        x = self.norm(z)
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        x = F.sigmoid(x)
+        return x  # (B, T, out_dim)
+        
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input curve, shape (B, T).
+        return:
+            torch.Tensor: Normalized curve, shape (B, T).
+        """
+        x = (x - self.vmin) / (self.vmax - self.vmin)
+        x = x.clamp(0., 1.)
+        return x
+
+    def denormalize(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input normalized curve, shape (B, T).
+        return:
+            torch.Tensor: Curve, shape (B, T).
+        """
+        x = x * (self.vmax - self.vmin) + self.vmin
+        return x
+c
+    def infer(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.forward(x)
+        curve = self.denormalize(x)
+        return curve
