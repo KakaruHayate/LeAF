@@ -115,7 +115,7 @@ class LeAF(nn.Module):
             curve_pred = self.decoder(emb)        # (B, T, curve_dim)
             return emb, preds, curve_pred
         else:
-            return emb, preds
+            return emb, preds, None
 
 
 class Decoder(nn.Module):
