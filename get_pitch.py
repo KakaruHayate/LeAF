@@ -2,6 +2,20 @@ import numpy as np
 from rmvpe import RMVPE
 
 
+def norm_f0(f0):
+    f0 = np.log2(f0)
+    return f0
+
+
+def denorm_f0(f0, uv, pitch_padding=None):
+    f0 = 2 ** f0
+    if uv is not None:
+        f0[uv > 0] = 0
+    if pitch_padding is not None:
+        f0[pitch_padding] = 0
+    return f0
+
+
 def interp_f0(f0, uv=None):
     if uv is None:
         uv = f0 == 0
