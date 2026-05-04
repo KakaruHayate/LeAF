@@ -5,24 +5,6 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 
 
-def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    scaling: Optional[float] = None,
-    dropout: float = 0.0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    if scaling is None:
-        scaling = query.size(-1) ** -0.5
-    attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
-    attn_weights = F.softmax(attn_weights, dim=-1)
-    attn_weights = F.dropout(attn_weights, p=dropout, training=module.training)
-    attn_output = torch.matmul(attn_weights, value)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    return attn_output, attn_weights
-
-
 class MelPatchEmbeddings(nn.Module):
     """
     Converts a Mel-spectrogram of shape `(batch, in_channels, n_mels, time_frames)` into 
@@ -94,12 +76,11 @@ class ViTSelfAttention(nn.Module):
         self.attention_head_size = hidden_size // num_attention_heads
         self.all_head_size = num_attention_heads * self.attention_head_size
         self.dropout = dropout
-        self.scaling = self.attention_head_size ** -0.5
         self.query = nn.Linear(hidden_size, self.all_head_size, bias=qkv_bias)
         self.key = nn.Linear(hidden_size, self.all_head_size, bias=qkv_bias)
         self.value = nn.Linear(hidden_size, self.all_head_size, bias=qkv_bias)
 
-    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch, seq_len, _ = hidden_states.shape
         new_shape = (batch, seq_len, self.num_attention_heads, self.attention_head_size)
         
@@ -107,11 +88,14 @@ class ViTSelfAttention(nn.Module):
         k = self.key(hidden_states).view(new_shape).transpose(1, 2)
         v = self.value(hidden_states).view(new_shape).transpose(1, 2)
         
-        context, attn_weights = eager_attention_forward(
-            self, q, k, v, scaling=self.scaling, dropout=self.dropout if self.training else 0.0,
+        context = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=False,
         )
-        context = context.reshape(batch, -1, self.all_head_size)
-        return context, attn_weights
+        # context shape: (batch, num_heads, seq_len, head_dim)
+        context = context.transpose(1, 2).reshape(batch, -1, self.all_head_size)
+        return context
 
 
 class ViTSelfOutput(nn.Module):
@@ -131,7 +115,7 @@ class ViTAttention(nn.Module):
         self.output = ViTSelfOutput(hidden_size, output_dropout)
         
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        self_output, _ = self.attention(hidden_states)
+        self_output = self.attention(hidden_states)
         return self.output(self_output)
 
 
