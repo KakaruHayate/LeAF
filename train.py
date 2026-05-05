@@ -1,24 +1,29 @@
 import argparse
 import random
 import pathlib
-import io
 import os
+import glob
+import re
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.data
-from torch.utils.tensorboard import SummaryWriter
 import tqdm
-from PIL import Image
 import matplotlib.pyplot as plt
+import yaml
 
 from dataset import LeAFTrainingDataset, LeAFValidationDataset, leaf_val_collate_fn
 from optimizer.muon import Muon_AdamW
 
 from mel_vit import MelViTModel
-from module import Embedder, ARPredictor, SIGReg
+from module import Embedder, ARPredictor, SIGReg, MLP
 from model import LeAF, Decoder
+
+import logger.utils
+from logger import utils
+from logger.saver import Saver
 
 # ==========================================
 # 1. 评估指标与可视化辅助函数
@@ -49,7 +54,7 @@ def plot_composite_saliency_map(mel, saliency, gt_curve=None, pred_curve=None):
     # 2. 绘制中层：Saliency 热区图叠加
     saliency_norm = np.abs(saliency)
     saliency_norm = saliency_norm / (np.max(saliency_norm) + 1e-8)
-    im_saliency = ax1.imshow(saliency_norm, aspect='auto', origin='lower', cmap='hot', alpha=0.5)
+    ax1.imshow(saliency_norm, aspect='auto', origin='lower', cmap='hot', alpha=0.5)
     
     # 3. 绘制顶层：GT 与 Pred 曲线 (若存在 Decoder)
     if gt_curve is not None and pred_curve is not None:
@@ -63,19 +68,11 @@ def plot_composite_saliency_map(mel, saliency, gt_curve=None, pred_curve=None):
     plt.tight_layout()
     return fig
 
-def fig_to_image(fig):
-    buf = io.BytesIO()
-    fig.savefig(buf, format='png', bbox_inches='tight')
-    buf.seek(0)
-    image = Image.open(buf)
-    plt.close(fig)
-    return image
-
 # ==========================================
 # 2. 验证循环 (Validation Loop)
 # ==========================================
 
-def validate_step(dataloader, model, device, writer, global_step, use_decoder):
+def validate_step(dataloader, model, device, saver, use_decoder):
     """执行完整的验证并绘制热区图"""
     model.eval()
 
@@ -87,14 +84,12 @@ def validate_step(dataloader, model, device, writer, global_step, use_decoder):
     
     with torch.no_grad():
         for idx, batch in enumerate(tqdm.tqdm(dataloader, desc='Validation', leave=False)):
-            # Dataset 返回: (B, T, mels), 我们需转换成 LeAF 期待的 (B, 1, mels, T)
             mel_gt = batch['clean_mel'].transpose(1, 2).unsqueeze(1).to(device)
             pitch_gt = batch['pitch'].to(device)
             opec_gt = batch['opec'].to(device)
             
             info = {'mel': mel_gt, 'action': pitch_gt}
             
-            # 模型前向
             emb, preds, curve_pred = model(info, mode='train')
             
             # Predictor 任务指标
@@ -107,7 +102,6 @@ def validate_step(dataloader, model, device, writer, global_step, use_decoder):
                 loss_mse = criterion_mse(curve_pred.squeeze(-1), l_gt)
                 sum_mse += loss_mse.item() * mel_gt.size(0)
                 
-                # 反归一化后计算 MAE 与 R2/Pearson 缓存
                 y_pred = model.decoder.denormalize(curve_pred.squeeze(-1))
                 sum_mae += F.l1_loss(y_pred, opec_gt).item() * mel_gt.size(0)
                 
@@ -116,28 +110,31 @@ def validate_step(dataloader, model, device, writer, global_step, use_decoder):
 
     dataset_len = len(dataloader.dataset)
     mean_pred_mse = sum_pred_mse / dataset_len
-    writer.add_scalar('val/Predictor_MSE', mean_pred_mse, global_step)
-    print(f" --- [Validation] Predictor MSE: {mean_pred_mse:.6f}")
+    
+    # 记录到 Logger
+    saver.log_value({'val/Predictor_MSE': mean_pred_mse})
+    saver.log_info(f" --- [Validation] Predictor MSE: {mean_pred_mse:.6f}")
 
     if use_decoder:
         mean_mse = sum_mse / dataset_len
         mean_mae = sum_mae / dataset_len
         
-        # 将变长序列拍平后计算相关性
         gt_all = torch.cat([g.view(-1) for g in gt_cache], dim=0)
         pred_all = torch.cat([p.view(-1) for p in pred_cache], dim=0)
         
         r2 = calc_r_squared(gt_all, pred_all)
         pearson = calc_pearson(gt_all, pred_all)
         
-        writer.add_scalar('val/OPEC_MSE', mean_mse, global_step)
-        writer.add_scalar('val/OPEC_MAE', mean_mae, global_step)
-        writer.add_scalar('val/OPEC_R2', r2, global_step)
-        writer.add_scalar('val/OPEC_Pearson', pearson, global_step)
-        print(f" --- [Validation] OPEC MAE: {mean_mae:.4f} | R2: {r2:.4f} | Pearson: {pearson:.4f}")
+        saver.log_value({
+            'val/OPEC_MSE': mean_mse,
+            'val/OPEC_MAE': mean_mae,
+            'val/OPEC_R2': r2,
+            'val/OPEC_Pearson': pearson
+        })
+        saver.log_info(f" --- [Validation] OPEC MAE: {mean_mae:.4f} | R2: {r2:.4f} | Pearson: {pearson:.4f}")
 
     # ==========================================
-    # 绘制可解释性热区图 (Saliency Map) - 仅取 Batch 第一个样本
+    # 绘制可解释性热区图 (Saliency Map)
     # ==========================================
     model.zero_grad()
     mel_sample = mel_gt[0:1].clone().detach().requires_grad_(True)
@@ -148,7 +145,6 @@ def validate_step(dataloader, model, device, writer, global_step, use_decoder):
         info_vis = {'mel': mel_sample, 'action': pitch_sample}
         emb_v, preds_v, curve_pred_v = model(info_vis, mode='train')
         
-        # 构建标量 Target 进行反传求导
         if use_decoder:
             target_value = curve_pred_v.sum()
         else:
@@ -161,15 +157,14 @@ def validate_step(dataloader, model, device, writer, global_step, use_decoder):
     
     if use_decoder:
         gt_np = opec_sample.cpu().numpy()
-        # 反归一化方便对比
         pred_np = model.decoder.denormalize(curve_pred_v[0].squeeze(-1)).detach().cpu().numpy()
         fig = plot_composite_saliency_map(mel_np, saliency_map, gt_np, pred_np)
     else:
         fig = plot_composite_saliency_map(mel_np, saliency_map)
 
-    img = fig_to_image(fig)
-    writer.add_image('val/saliency_overlay', np.array(img).transpose(2, 0, 1), global_step)
-    model.train() # 恢复训练模式
+    # Saver 将直接处理 matplotlib Figure
+    saver.log_figure({'val/saliency_overlay': fig})
+    model.train() 
 
 
 # ==========================================
@@ -180,6 +175,7 @@ def main():
     parser = argparse.ArgumentParser(description="LeAF / World Model SVS Training")
     parser.add_argument('--exp_name', '-N', type=str, default="LeAF_Baseline")
     parser.add_argument('--dataset', '-d', required=True, help="Path to processed dataset")
+    parser.add_argument('--pretrained_model', '-P', type=str, default=None, help="Path to pretrained checkpoint to load")
     
     # 网络架构参数
     parser.add_argument('--use_decoder', action='store_true', help="If set, enable Decoder to predict OPEC")
@@ -193,6 +189,7 @@ def main():
     # 训练循环参数
     parser.add_argument('--batchsize', '-B', type=int, default=16)
     parser.add_argument('--cropsize', '-C', type=int, default=160)
+    parser.add_argument('--epoch', '-E', type=int, default=1000)
     parser.add_argument('--max_steps', type=int, default=500000)
     parser.add_argument('--save_val_interval', type=int, default=5000, help="Steps between save and validation")
     
@@ -217,8 +214,9 @@ def main():
     random.seed(seed)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    writer = SummaryWriter(log_dir=f"./runs/{args.exp_name}")
-    os.makedirs(f"./checkpoints/{args.exp_name}", exist_ok=True)
+    
+    # 初始化 Logger
+    saver = Saver(args.exp_name)
 
     # -----------------------
     # 1. 准备 DataLoader
@@ -251,7 +249,7 @@ def main():
     )
     action_encoder = Embedder(input_dim=1, emb_dim=args.hidden_size)
     predictor = ARPredictor(
-        num_frames=3, depth=args.pred_depth, heads=args.pred_heads,
+        num_frames=8096, depth=args.pred_depth, heads=args.pred_heads,
         mlp_dim=args.hidden_size*4, input_dim=args.hidden_size, hidden_dim=args.hidden_size
     )
     
@@ -259,11 +257,29 @@ def main():
     if args.use_decoder:
         decoder = Decoder(hidden_size=args.hidden_size, out_dim=1, expansion=args.decoder_expansion)
         
-    model = LeAF(encoder, predictor, action_encoder, decoder=decoder).to(device)
+    projector = MLP(
+        input_dim=args.hidden_size,
+        output_dim=args.hidden_size,
+        hidden_dim=2048,
+        norm_fn=torch.nn.BatchNorm1d,
+    )
+
+    predictor_proj = MLP(
+        input_dim=args.hidden_size,
+        output_dim=args.hidden_size,
+        hidden_dim=2048,
+        norm_fn=torch.nn.BatchNorm1d,
+    )
     
-    # 构建损失函数
+    model = LeAF(encoder, predictor, action_encoder, projector=projector, pred_proj=predictor_proj, decoder=decoder).to(device)
+    
+    params_count = utils.get_network_paras_amount({'model': model})
+    print(model)
+    saver.log_info('--- model size ---')
+    saver.log_info(params_count)
+    
     sigreg_criterion = SIGReg(knots=17, num_proj=1024).to(device)
-    huber_loss = nn.HuberLoss(reduction='none') # 使用 none 以便计算指数权重
+    huber_loss = nn.HuberLoss(reduction='none')
 
     # -----------------------
     # 3. 优化器与调度器
@@ -277,85 +293,119 @@ def main():
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_step_size, gamma=args.lr_gamma)
 
     # -----------------------
-    # 4. Step 驱动的主训练循环
+    # 4. 恢复状态 / 加载预训练模型
     # -----------------------
+    start_epoch = 0
     global_step = 0
+    
+    # 优先检查是否存在当前 exp_name 的续训权重
+    ckpt_files = glob.glob(str(saver.exp_dir / "checkpoint_*.pt"))
+    if len(ckpt_files) > 0:
+        latest_ckpt = max(ckpt_files, key=lambda x: int(re.search(r'checkpoint_(\d+)\.pt', x).group(1)))
+        saver.log_info(f"Found existing experiment! Resuming training from: {latest_ckpt}")
+        ckpt = torch.load(latest_ckpt, map_location=device)
+        model.load_state_dict(ckpt['model'])
+        optimizer.load_state_dict(ckpt['optimizer'])
+        scheduler.load_state_dict(ckpt['scheduler'])
+        start_epoch = ckpt['epoch']
+        global_step = ckpt['global_step']
+        saver.global_step = global_step
+    # 否则检查是否传入了外部预训练权重
+    elif args.pretrained_model is not None:
+        saver.log_info(f"Loading external pretrained model: {args.pretrained_model}")
+        ckpt = torch.load(args.pretrained_model, map_location=device)
+        state_dict = ckpt['model'] if 'model' in ckpt else ckpt
+        # strict=False 允许加载缺失/冗余 decoder 的情况
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        saver.log_info(f"Pretrained missing keys (e.g. new decoder layers): {missing}")
+        saver.log_info(f"Pretrained unexpected keys: {unexpected}")
+
+    # -----------------------
+    # 5. Epoch 驱动的进度条主训练循环
+    # -----------------------
     model.train()
     
-    # 循环控制直到达到 max_steps
-    train_iter = iter(train_loader)
-    
-    pbar = tqdm.tqdm(total=args.max_steps, desc="Training")
-    while global_step < args.max_steps:
-        try:
-            batch = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_loader)
-            batch = next(train_iter)
+    for epoch in range(start_epoch, args.epoch):
+        if global_step >= args.max_steps:
+            break
             
-        # 数据转置与挂载: Dataset的 (B, T, mel) -> (B, 1, mel, T)
-        mel_in = batch['aug_mel'].transpose(1, 2).unsqueeze(1).to(device)
-        pitch_in = batch['pitch'].to(device)
-        opec_gt = batch['opec'].to(device)
+        # 设置 tqdm 进度条，包含 epoch 提示
+        pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch}/{args.epoch}", leave=True)
         
-        info = {'mel': mel_in, 'action': pitch_in}
-        
-        optimizer.zero_grad()
-        
-        emb, preds, curve_pred = model(info, mode='train')
-        
-        # 1. 均方误差预测损失 (World Model 核心)
-        loss_pred = F.mse_loss(preds[:, :-1, :], emb[:, 1:, :])
-        
-        # 2. SIGReg 表征防止坍缩损失
-        loss_sigreg = sigreg_criterion(emb.transpose(0, 1))
-        
-        # 3. Decoder 任务损失 (若开启)
-        loss_curve = torch.tensor(0.0, device=device)
-        if args.use_decoder:
-            l_gt = model.decoder.normalize(opec_gt)
-            # 根据 GT 绝对值大小给予指数平滑权重，重点关注动作幅度大的区域
-            sigma = 0.1
-            weights = torch.exp(-l_gt.abs() / sigma).unsqueeze(-1)
-            raw_huber = huber_loss(curve_pred, l_gt.unsqueeze(-1))
-            loss_curve = (weights * raw_huber).mean()
+        for batch in pbar:
+            # 兼容 logger 的 global_step 并与自定义 global_step 同步
+            saver.global_step_increment()
+            global_step = saver.global_step
             
-        # 联合优化
-        total_loss = loss_pred + args.lambd * loss_sigreg + loss_curve
-        total_loss.backward()
-        
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        scheduler.step()
-        
-        # Logging
-        if global_step % 50 == 0:
-            writer.add_scalar("Train/Total_Loss", total_loss.item(), global_step)
-            writer.add_scalar("Train/Predictor_MSE", loss_pred.item(), global_step)
-            writer.add_scalar("Train/SIGReg", loss_sigreg.item(), global_step)
+            mel_in = batch['aug_mel'].transpose(1, 2).unsqueeze(1).to(device)
+            pitch_in = batch['pitch'].to(device)
+            opec_gt = batch['opec'].to(device)
+            
+            info = {'mel': mel_in, 'action': pitch_in}
+            
+            optimizer.zero_grad()
+            emb, preds, curve_pred = model(info, mode='train')
+            
+            loss_pred = F.mse_loss(preds[:, :-1, :], emb[:, 1:, :])
+            loss_sigreg = sigreg_criterion(emb.transpose(0, 1))
+            
+            loss_curve = torch.tensor(0.0, device=device)
             if args.use_decoder:
-                writer.add_scalar("Train/OPEC_Huber", loss_curve.item(), global_step)
-            writer.add_scalar("Train/LR", scheduler.get_last_lr()[0], global_step)
+                l_gt = model.decoder.normalize(opec_gt)
+                loss_curve = huber_loss(curve_pred, l_gt.unsqueeze(-1))
+                
+            total_loss = loss_pred + args.lambd * loss_sigreg + loss_curve
+            total_loss.backward()
             
-        global_step += 1
-        pbar.update(1)
-        
-        # ==========================================
-        # 5. 定期 Save 与 Validation (Fixed Step)
-        # ==========================================
-        if global_step % args.save_val_interval == 0:
-            print(f"\n--- Saving & Validation at Step {global_step} ---")
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
             
-            # 先保存模型 (Save)
-            checkpoint_path = f"./checkpoints/{args.exp_name}/model_step_{global_step}.pt"
-            torch.save(model.state_dict(), checkpoint_path)
+            current_lr = scheduler.get_last_lr()[0]
             
-            # 后执行验证 (Validate)
-            validate_step(val_loader, model, device, writer, global_step, args.use_decoder)
+            # 更新进度条右侧状态面板
+            pbar_dict = {
+                'loss': f"{total_loss.item():.4f}", 
+                'pred_mse': f"{loss_pred.item():.4f}",
+                'lr': f"{current_lr:.2e}"
+            }
+            if args.use_decoder:
+                pbar_dict['opec_huber'] = f"{loss_curve.item():.4f}"
+            pbar.set_postfix(pbar_dict)
+            
+            # Logging
+            if global_step % 50 == 0:
+                saver.log_value({
+                    "Train/Total_Loss": total_loss.item(),
+                    "Train/Predictor_MSE": loss_pred.item(),
+                    "Train/SIGReg": loss_sigreg.item(),
+                    "Train/LR": current_lr
+                })
+                if args.use_decoder:
+                    saver.log_value({"Train/OPEC_Huber": loss_curve.item()})
+            
+            # ==========================================
+            # 按照 Step 保存权重与验证
+            # ==========================================
+            if global_step % args.save_val_interval == 0:
+                saver.log_info(f"\n--- Saving & Validation at Step {global_step} ---")
+                
+                # 统一打包当前所有状态以供无缝续训
+                ckpt_path = saver.exp_dir / f"checkpoint_{global_step}.pt"
+                torch.save({
+                    'model': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                    'epoch': epoch,
+                    'global_step': global_step
+                }, ckpt_path)
+                
+                validate_step(val_loader, model, device, saver, args.use_decoder)
+                
+            if global_step >= args.max_steps:
+                break
 
-    pbar.close()
-    writer.close()
-    print("Training Complete!")
+    saver.log_info("Training Complete!")
 
 if __name__ == '__main__':
     main()

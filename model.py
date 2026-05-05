@@ -159,7 +159,7 @@ class Decoder(nn.Module):
         """
         x = x * (self.vmax - self.vmin) + self.vmin
         return x
-c
+
     def infer(self, x: torch.Tensor) -> torch.Tensor:
         x = self.forward(x)
         curve = self.denormalize(x)
