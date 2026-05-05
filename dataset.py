@@ -4,8 +4,9 @@ import random
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from torch.nn.utils.rnn import pad_sequence
 
- from augment.utils import (
+from augment.utils import (
      add_diverse_background_noise,
      frequency_masking,
      time_masking,
@@ -77,7 +78,7 @@ class LeAFTrainingDataset(Dataset):
         )[0]
 
         if mask_type == 'time':
-            return time_masking(mel_tensor, time_mask_param=3 num_masks=2)
+            return time_masking(mel_tensor, time_mask_param=3, num_masks=2)
         elif mask_type == 'freq':
             return frequency_masking(mel_tensor, freq_mask_param=3, num_masks=2)
         else:
@@ -205,3 +206,29 @@ class LeAFValidationDataset(Dataset):
             "pitch": pitch_tensor,
             "opec": opec_tensor
         }
+
+def leaf_val_collate_fn(batch):
+    """
+    针对变长序列的验证集批处理函数
+    """
+    # 取出各自的序列组成的 list
+    mels = [item['clean_mel'] for item in batch]
+    pitches = [item['pitch'] for item in batch]
+    opecs = [item['opec'] for item in batch]
+    
+    # 记录每个样本的真实长度，方便在算 Loss 时进行 Mask
+    lengths = torch.tensor([mel.shape[0] for mel in mels], dtype=torch.long)
+    
+    # 使用 pad_sequence 将它们补齐到 Batch 中最长的一条
+    # batch_first=True 保证输出形状为 (B, T, ...)
+    # mel 频谱的 padding 默认值通常可以用之前设置的最小值 -12，或者 0
+    padded_mels = pad_sequence(mels, batch_first=True, padding_value=-12.0)
+    padded_pitches = pad_sequence(pitches, batch_first=True, padding_value=0.0)
+    padded_opecs = pad_sequence(opecs, batch_first=True, padding_value=0.0)
+    
+    return {
+        "clean_mel": padded_mels,
+        "pitch": padded_pitches,
+        "opec": padded_opecs,
+        "lengths": lengths
+    }
