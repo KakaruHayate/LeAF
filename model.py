@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from muon_layer import AdamWLinear, AdamWCov1d
 
 class LeAF(nn.Module):
     """
@@ -127,7 +127,7 @@ class Decoder(nn.Module):
         self.fc1 = nn.Linear(hidden_size, hidden_size * expansion)
         self.act = nn.GELU()
         self.dropout = nn.Dropout(dropout)
-        self.fc2 = nn.Linear(hidden_size * expansion, ope_dim)
+        self.fc2 = AdamWLinear(hidden_size * expansion, out_dim)
 
     def forward(self, z):
         # z: (B, T, hidden_size)

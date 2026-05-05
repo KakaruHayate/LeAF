@@ -7,6 +7,7 @@ from torch.nn import Module, Parameter, Embedding
 from typing import List
 from itertools import repeat
 from .chained_optimizer import ChainedOptimizer, OptimizerSpec
+from muon_layer import AdamWLinear, AdamWCov1d
 
 
 # https://arxiv.org/pdf/2505.16932
@@ -172,21 +173,6 @@ class Muon(torch.optim.Optimizer):
                 torch._foreach_add_(p, g.view(original_shape).unbind(0), alpha=-group["lr"] * max(g[0].size()) ** 0.5)
 
 
-class AdamWLinear(torch.nn.Linear):
-    def __init__(
-            self,
-            in_features: int,
-            out_features: int,
-            *args,
-            bias: bool = True,
-            **kwargs
-    ):
-        super().__init__(in_features, out_features, *args, bias=bias, **kwargs)
-        nn.init.xavier_uniform_(self.weight)
-        if bias:
-            nn.init.constant_(self.bias, 0.)
-
-
 def get_params_for_muon(model) -> List[Parameter]:
     """
     Filter parameters of a module into two groups: those that can be optimized by Muon,
@@ -196,7 +182,7 @@ def get_params_for_muon(model) -> List[Parameter]:
     Returns:
         A list of parameters that should be optimized with muon.
     """
-    excluded_module_classes = (nn.Embedding, AdamWLinear)
+    excluded_module_classes = (nn.Embedding, AdamWLinear, AdamWCov1d)
     muon_params = []
     # BFS through all submodules and exclude parameters from certain module types
     queue = collections.deque([model])

@@ -352,7 +352,7 @@ def main():
             loss_curve = torch.tensor(0.0, device=device)
             if args.use_decoder:
                 l_gt = model.decoder.normalize(opec_gt)
-                loss_curve = huber_loss(curve_pred, l_gt.unsqueeze(-1))
+                loss_curve = huber_loss(curve_pred, l_gt.unsqueeze(-1)).mean()
                 
             total_loss = loss_pred + args.lambd * loss_sigreg + loss_curve
             total_loss.backward()

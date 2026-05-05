@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from einops import rearrange
+from muon_layer import AdamWLinear, AdamWCov1d
 
 def modulate(x, shift, scale):
     """AdaLN-zero modulation"""
@@ -231,7 +232,7 @@ class MLP(nn.Module):
             nn.Linear(input_dim, hidden_dim),
             norm_fn,
             act_fn(),
-            nn.Linear(hidden_dim, output_dim or input_dim),
+            AdamWLinear(hidden_dim, output_dim or input_dim),
         )
 
     def forward(self, x):
