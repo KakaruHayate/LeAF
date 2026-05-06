@@ -7,7 +7,7 @@ from torch.nn import Module, Parameter, Embedding
 from typing import List
 from itertools import repeat
 from .chained_optimizer import ChainedOptimizer, OptimizerSpec
-from muon_layer import AdamWLinear, AdamWCov1d
+from muon_layer import AdamWLinear, AdamWCov1d, AdamWCov2d
 
 
 # https://arxiv.org/pdf/2505.16932
@@ -182,7 +182,7 @@ def get_params_for_muon(model) -> List[Parameter]:
     Returns:
         A list of parameters that should be optimized with muon.
     """
-    excluded_module_classes = (nn.Embedding, AdamWLinear, AdamWCov1d)
+    excluded_module_classes = (nn.Embedding, AdamWLinear, AdamWCov1d, AdamWCov2d)
     muon_params = []
     # BFS through all submodules and exclude parameters from certain module types
     queue = collections.deque([model])

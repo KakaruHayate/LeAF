@@ -154,81 +154,35 @@ class LeAFTrainingDataset(Dataset):
         }
 
 
-class LeAFValidationDataset(Dataset):
+class LeAFValidationDataset(torch.utils.data.Dataset):
     def __init__(self, root_dir: pathlib.Path):
-        """
-        LEAF 项目验证集 DataLoader
-        特点：加载完整的序列特征，不包含任何随机切片或数据增强。
-        """
         if not isinstance(root_dir, pathlib.Path):
             root_dir = pathlib.Path(root_dir)
             
         self.root_dir = root_dir
-
-        # 读取验证集文件列表
         self.files = []
-        valid_list_path = root_dir / 'valid.txt'
         
-        if not valid_list_path.exists():
-            raise FileNotFoundError(f"Validation list not found at: {valid_list_path}")
-            
-        with open(valid_list_path, 'r', encoding='utf8') as f:
+        with open(root_dir / 'valid.txt', 'r', encoding='utf8') as f:
             for line in f:
-                # 拼接完整的 npz 文件路径
-                file_path = root_dir / line.strip()
-                self.files.append(file_path)
+                self.files.append(root_dir / line.strip())
 
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, idx):
-        # 1. 读取对应索引的 npz 文件
         data = np.load(self.files[idx])
         
-        # 2. 提取我们在预处理时保存的三个核心特征
-        spectrogram = data['spectrogram']  # 形状: (T, mel_bins)
-        pitch = data['pitch']              # 形状: (T,)
-        opec = data['opec']                # 形状: (T,)
+        spectrogram = data['spectrogram']  # (T, n_mels)
+        pitch = data['pitch']              # (T,)
+        opec = data['opec']                # (T,)
         
-        # 3. 基础的数值稳定性处理 (与训练集保持相同的数值底线)
+        # 基础裁剪
         spectrogram = np.clip(spectrogram, a_min=-12, a_max=None)
         
-        # 4. 转换为 PyTorch Tensors
-        # 注意：这里我们保留原始的 (T, n_mels) 形状，不进行转置
-        # 因为后续的 Padding 和网络模型通常习惯 Batch First 的序列输入: (Batch, Time, Dim)
+        # 转换为 Tensor
         mel_tensor = torch.from_numpy(spectrogram).float()
         pitch_tensor = torch.from_numpy(pitch).float()
         opec_tensor = torch.from_numpy(opec).float()
         
-        # 5. 使用与训练集一致的字典形式返回
-        return {
-            "clean_mel": mel_tensor,
-            "pitch": pitch_tensor,
-            "opec": opec_tensor
-        }
-
-def leaf_val_collate_fn(batch):
-    """
-    针对变长序列的验证集批处理函数
-    """
-    # 取出各自的序列组成的 list
-    mels = [item['clean_mel'] for item in batch]
-    pitches = [item['pitch'] for item in batch]
-    opecs = [item['opec'] for item in batch]
-    
-    # 记录每个样本的真实长度，方便在算 Loss 时进行 Mask
-    lengths = torch.tensor([mel.shape[0] for mel in mels], dtype=torch.long)
-    
-    # 使用 pad_sequence 将它们补齐到 Batch 中最长的一条
-    # batch_first=True 保证输出形状为 (B, T, ...)
-    # mel 频谱的 padding 默认值通常可以用之前设置的最小值 -12，或者 0
-    padded_mels = pad_sequence(mels, batch_first=True, padding_value=-12.0)
-    padded_pitches = pad_sequence(pitches, batch_first=True, padding_value=0.0)
-    padded_opecs = pad_sequence(opecs, batch_first=True, padding_value=0.0)
-    
-    return {
-        "clean_mel": padded_mels,
-        "pitch": padded_pitches,
-        "opec": padded_opecs,
-        "lengths": lengths
-    }
+        # 按照简单的 Tuple 顺序返回
+        return mel_tensor, pitch_tensor, opec_tensor

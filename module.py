@@ -149,21 +149,21 @@ class Transformer(nn.Module):
         self.layers = nn.ModuleList([])
 
         self.input_proj = (
-            nn.Linear(input_dim, hidden_dim)
-            if input_dim != hidden_dim
-            else nn.Identity()
+            AdamWLinear(input_dim, hidden_dim)
+            #if input_dim != hidden_dim
+            #else nn.Identity()
         )
 
         self.cond_proj = (
-            nn.Linear(input_dim, hidden_dim)
-            if input_dim != hidden_dim
-            else nn.Identity()
+            AdamWLinear(input_dim, hidden_dim)
+            #if input_dim != hidden_dim
+            #else nn.Identity()
         )
 
         self.output_proj = (
-            nn.Linear(hidden_dim, output_dim)
-            if hidden_dim != output_dim
-            else nn.Identity()
+            AdamWLinear(hidden_dim, output_dim)
+            #if hidden_dim != output_dim
+            #else nn.Identity()
         )
 
         for _ in range(depth):
@@ -196,7 +196,7 @@ class Embedder(nn.Module):
         mlp_scale=4,
     ):
         super().__init__()
-        self.patch_embed = nn.Conv1d(input_dim, smoothed_dim, kernel_size=1, stride=1)
+        self.patch_embed = AdamWCov1d(input_dim, smoothed_dim, kernel_size=1, stride=1)
         self.embed = nn.Sequential(
             nn.Linear(smoothed_dim, mlp_scale * emb_dim),
             nn.SiLU(),

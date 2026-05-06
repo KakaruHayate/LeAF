@@ -18,3 +18,8 @@ class AdamWCov1d(torch.nn.Conv1d):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         torch.nn.init.kaiming_normal_(self.weight)
+        
+class AdamWCov2d(torch.nn.Conv2d):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        torch.nn.init.kaiming_normal_(self.weight)

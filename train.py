@@ -14,7 +14,7 @@ import tqdm
 import matplotlib.pyplot as plt
 import yaml
 
-from dataset import LeAFTrainingDataset, LeAFValidationDataset, leaf_val_collate_fn
+from dataset import LeAFTrainingDataset, LeAFValidationDataset
 from optimizer.muon import Muon_AdamW
 
 from mel_vit import MelViTModel
@@ -72,46 +72,66 @@ def plot_composite_saliency_map(mel, saliency, gt_curve=None, pred_curve=None):
 # 2. 验证循环 (Validation Loop)
 # ==========================================
 
-def validate_step(dataloader, model, device, saver, use_decoder):
-    """执行完整的验证并绘制热区图"""
+def validate_step(dataloader, model, device, saver, use_decoder, draw=True):
     model.eval()
 
     sum_pred_mse = 0.0
-    sum_mae, sum_mse = 0.0, 0.0
-    gt_cache, pred_cache = [], []
-    
-    criterion_mse = nn.MSELoss()
-    
+    sum_mae = 0.0
+    sum_mse = 0.0
+    gt_cache = []
+    pred_cache = []
+    criterion = nn.MSELoss()
+
     with torch.no_grad():
-        for idx, batch in enumerate(tqdm.tqdm(dataloader, desc='Validation', leave=False)):
-            mel_gt = batch['clean_mel'].transpose(1, 2).unsqueeze(1).to(device)
-            pitch_gt = batch['pitch'].to(device)
-            opec_gt = batch['opec'].to(device)
+        for idx, (mel_gt, pitch_gt, opec_gt) in enumerate(
+                tqdm.tqdm(dataloader, total=len(dataloader), desc='Validation', leave=False)):
             
-            info = {'mel': mel_gt, 'action': pitch_gt}
+            # 转置并补充维度: (B, T, mels) -> (B, 1, mels, T)
+            mel_in = mel_gt.transpose(1, 2).unsqueeze(1).to(device)
+            pitch_in = pitch_gt.to(device)
+            opec_gt = opec_gt.to(device)
             
+            info = {'mel': mel_in, 'action': pitch_in}
             emb, preds, curve_pred = model(info, mode='train')
             
-            # Predictor 任务指标
-            pred_mse = criterion_mse(preds[:, :-1, :], emb[:, 1:, :])
+            # 1. Predictor 任务指标
+            pred_mse = criterion(preds[:, :-1, :], emb[:, 1:, :])
             sum_pred_mse += pred_mse.item() * mel_gt.size(0)
 
-            # Decoder 任务指标
+            # 2. Decoder 任务指标与绘图
             if use_decoder:
                 l_gt = model.decoder.normalize(opec_gt)
-                loss_mse = criterion_mse(curve_pred.squeeze(-1), l_gt)
+                loss_mse = criterion(curve_pred.squeeze(-1), l_gt)
                 sum_mse += loss_mse.item() * mel_gt.size(0)
                 
                 y_pred = model.decoder.denormalize(curve_pred.squeeze(-1))
-                sum_mae += F.l1_loss(y_pred, opec_gt).item() * mel_gt.size(0)
-                
                 gt_cache.append(opec_gt)
                 pred_cache.append(y_pred)
+                sum_mae += F.l1_loss(y_pred, opec_gt).item() * mel_gt.size(0)
+                
+                # 绘制当前样本的预测曲线对比图
+                if draw:
+                    spec_draw = mel_gt[0].cpu().numpy()      # (T, mels)
+                    curve_gt_draw = opec_gt[0].cpu().numpy() # (T,)
+                    curve_pred_draw = y_pred[0].cpu().numpy()# (T,)
+                    
+                    # 避免过长的序列导致图片比例失调
+                    if spec_draw.shape[0] > 1024:
+                        spec_draw = spec_draw[:1024]
+                        curve_gt_draw = curve_gt_draw[:1024]
+                        curve_pred_draw = curve_pred_draw[:1024]
+                        
+                    saver.log_figure({
+                        f'val_curve_{idx}': logger.utils.draw_plot(
+                            spec=spec_draw,
+                            curve_gt=curve_gt_draw,
+                            curve_pred=curve_pred_draw
+                        )
+                    })
 
     dataset_len = len(dataloader.dataset)
     mean_pred_mse = sum_pred_mse / dataset_len
     
-    # 记录到 Logger
     saver.log_value({'val/Predictor_MSE': mean_pred_mse})
     saver.log_info(f" --- [Validation] Predictor MSE: {mean_pred_mse:.6f}")
 
@@ -133,38 +153,7 @@ def validate_step(dataloader, model, device, saver, use_decoder):
         })
         saver.log_info(f" --- [Validation] OPEC MAE: {mean_mae:.4f} | R2: {r2:.4f} | Pearson: {pearson:.4f}")
 
-    # ==========================================
-    # 绘制可解释性热区图 (Saliency Map)
-    # ==========================================
-    model.zero_grad()
-    mel_sample = mel_gt[0:1].clone().detach().requires_grad_(True)
-    pitch_sample = pitch_gt[0:1]
-    opec_sample = opec_gt[0]
-
-    with torch.enable_grad():
-        info_vis = {'mel': mel_sample, 'action': pitch_sample}
-        emb_v, preds_v, curve_pred_v = model(info_vis, mode='train')
-        
-        if use_decoder:
-            target_value = curve_pred_v.sum()
-        else:
-            target_value = preds_v.sum()
-            
-        target_value.backward()
-        saliency_map = mel_sample.grad[0, 0].cpu().numpy()
-
-    mel_np = mel_sample[0, 0].detach().cpu().numpy()
-    
-    if use_decoder:
-        gt_np = opec_sample.cpu().numpy()
-        pred_np = model.decoder.denormalize(curve_pred_v[0].squeeze(-1)).detach().cpu().numpy()
-        fig = plot_composite_saliency_map(mel_np, saliency_map, gt_np, pred_np)
-    else:
-        fig = plot_composite_saliency_map(mel_np, saliency_map)
-
-    # Saver 将直接处理 matplotlib Figure
-    saver.log_figure({'val/saliency_overlay': fig})
-    model.train() 
+    model.train()
 
 
 # ==========================================
@@ -178,25 +167,26 @@ def main():
     parser.add_argument('--pretrained_model', '-P', type=str, default=None, help="Path to pretrained checkpoint to load")
     
     # 网络架构参数
-    parser.add_argument('--use_decoder', action='store_true', help="If set, enable Decoder to predict OPEC")
+    parser.add_argument('--use_decoder', default=True, action='store_true', help="If set, enable Decoder to predict OPEC")
     parser.add_argument('--hidden_size', type=int, default=192)
     parser.add_argument('--vit_layers', type=int, default=12)
     parser.add_argument('--vit_heads', type=int, default=3)
     parser.add_argument('--pred_depth', type=int, default=6)
     parser.add_argument('--pred_heads', type=int, default=64)
-    parser.add_argument('--decoder_expansion', type=int, default=2)
+    parser.add_argument('--decoder_expansion', type=int, default=4)
+    parser.add_argument('--skip_steps', type=int, default=40, help="Number of frames to skip for prediction target")
     
     # 训练循环参数
     parser.add_argument('--batchsize', '-B', type=int, default=16)
     parser.add_argument('--cropsize', '-C', type=int, default=160)
     parser.add_argument('--epoch', '-E', type=int, default=1000)
     parser.add_argument('--max_steps', type=int, default=500000)
-    parser.add_argument('--save_val_interval', type=int, default=5000, help="Steps between save and validation")
+    parser.add_argument('--save_val_interval', type=int, default=4000, help="Steps between save and validation")
     
     # 优化器与调度器参数
-    parser.add_argument('--lr', type=float, default=5e-5)
+    parser.add_argument('--lr', type=float, default=0.0005)
     parser.add_argument('--weight_decay', type=float, default=1e-3)
-    parser.add_argument('--lr_step_size', type=int, default=5000)
+    parser.add_argument('--lr_step_size', type=int, default=4000)
     parser.add_argument('--lr_gamma', type=float, default=0.5)
     parser.add_argument('--lambd', type=float, default=0.1, help="SIGReg scale factor")
     
@@ -235,11 +225,16 @@ def main():
     )
     
     val_dataset = LeAFValidationDataset(root_dir=args.dataset)
+    
+    # 修改这里：batch_size 改为 1，去掉 collate_fn，num_workers 设为 0 以防死锁
     val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=args.batchsize, shuffle=False, 
-        collate_fn=leaf_val_collate_fn, num_workers=2
+        val_dataset, 
+        batch_size=1, 
+        shuffle=False, 
+        num_workers=0, 
+        pin_memory=True
     )
-
+    
     # -----------------------
     # 2. 构建模型
     # -----------------------
@@ -261,14 +256,14 @@ def main():
         input_dim=args.hidden_size,
         output_dim=args.hidden_size,
         hidden_dim=2048,
-        norm_fn=torch.nn.BatchNorm1d,
+        norm_fn=nn.LayerNorm,
     )
 
     predictor_proj = MLP(
         input_dim=args.hidden_size,
         output_dim=args.hidden_size,
         hidden_dim=2048,
-        norm_fn=torch.nn.BatchNorm1d,
+        norm_fn=nn.LayerNorm,
     )
     
     model = LeAF(encoder, predictor, action_encoder, projector=projector, pred_proj=predictor_proj, decoder=decoder).to(device)
@@ -340,11 +335,14 @@ def main():
             mel_in = batch['aug_mel'].transpose(1, 2).unsqueeze(1).to(device)
             pitch_in = batch['pitch'].to(device)
             opec_gt = batch['opec'].to(device)
-            
+            pitch_in = (1 + pitch_in / 700).log()
             info = {'mel': mel_in, 'action': pitch_in}
             
             optimizer.zero_grad()
+            skip_steps = args.skip_steps  # 跳跃步数，可以设为超参数
+
             emb, preds, curve_pred = model(info, mode='train')
+            loss_pred = F.mse_loss(preds[:, :-skip_steps, :], emb[:, skip_steps:, :])
             
             loss_pred = F.mse_loss(preds[:, :-1, :], emb[:, 1:, :])
             loss_sigreg = sigreg_criterion(emb.transpose(0, 1))

@@ -3,6 +3,25 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
+from muon_layer import AdamWLinear, AdamWCov1d, AdamWCov2d
+
+
+def eager_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scaling: Optional[float] = None,
+    dropout: float = 0.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if scaling is None:
+        scaling = query.size(-1) ** -0.5
+    attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
+    attn_weights = F.softmax(attn_weights, dim=-1)
+    attn_weights = F.dropout(attn_weights, p=dropout, training=module.training)
+    attn_output = torch.matmul(attn_weights, value)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output, attn_weights
 
 
 class MelPatchEmbeddings(nn.Module):
@@ -14,7 +33,7 @@ class MelPatchEmbeddings(nn.Module):
         super().__init__()
         self.n_mels = n_mels
         # Convolution over the entire frequency axis, sliding 1 frame at a time.
-        self.projection = nn.Conv2d(
+        self.projection = AdamWCov2d(
             in_channels, 
             hidden_size, 
             kernel_size=(n_mels, 1), 
@@ -76,11 +95,12 @@ class ViTSelfAttention(nn.Module):
         self.attention_head_size = hidden_size // num_attention_heads
         self.all_head_size = num_attention_heads * self.attention_head_size
         self.dropout = dropout
+        self.scaling = self.attention_head_size ** -0.5
         self.query = nn.Linear(hidden_size, self.all_head_size, bias=qkv_bias)
         self.key = nn.Linear(hidden_size, self.all_head_size, bias=qkv_bias)
         self.value = nn.Linear(hidden_size, self.all_head_size, bias=qkv_bias)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         batch, seq_len, _ = hidden_states.shape
         new_shape = (batch, seq_len, self.num_attention_heads, self.attention_head_size)
         
@@ -88,14 +108,11 @@ class ViTSelfAttention(nn.Module):
         k = self.key(hidden_states).view(new_shape).transpose(1, 2)
         v = self.value(hidden_states).view(new_shape).transpose(1, 2)
         
-        context = F.scaled_dot_product_attention(
-            q, k, v,
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=False,
+        context, attn_weights = eager_attention_forward(
+            self, q, k, v, scaling=self.scaling, dropout=self.dropout if self.training else 0.0,
         )
-        # context shape: (batch, num_heads, seq_len, head_dim)
-        context = context.transpose(1, 2).reshape(batch, -1, self.all_head_size)
-        return context
+        context = context.reshape(batch, -1, self.all_head_size)
+        return context, attn_weights
 
 
 class ViTSelfOutput(nn.Module):
@@ -115,7 +132,7 @@ class ViTAttention(nn.Module):
         self.output = ViTSelfOutput(hidden_size, output_dropout)
         
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        self_output = self.attention(hidden_states)
+        self_output, _ = self.attention(hidden_states)
         return self.output(self_output)
 
 
@@ -131,7 +148,7 @@ class ViTIntermediate(nn.Module):
 class ViTOutput(nn.Module):
     def __init__(self, hidden_size: int, dropout: float):
         super().__init__()
-        self.dense = nn.Linear(4 * hidden_size, hidden_size)
+        self.dense = AdamWLinear(4 * hidden_size, hidden_size)
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
