@@ -108,7 +108,10 @@ class LeAF(nn.Module):
 
         # ---------- training ----------
         emb = info['emb']                         # (B, T, D)
-        act_emb = info['act_emb']                 # (B, T, A_emb)
+        if 'action' in info:
+            act_emb = info['act_emb']                 # (B, T, A_emb)
+        else:
+            act_emb = None
         preds = self.predict(emb, act_emb)        # (B, T, D')
 
         if self.decoder is not None:

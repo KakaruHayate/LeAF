@@ -20,6 +20,7 @@ from optimizer.muon import Muon_AdamW
 from mel_vit import MelViTModel
 from module import Embedder, ARPredictor, SIGReg, MLP
 from model import LeAF, Decoder
+from convnext import ConvNeXtDecoder
 
 import logger.utils
 from logger import utils
@@ -88,10 +89,11 @@ def validate_step(dataloader, model, device, saver, use_decoder, draw=True):
             
             # 转置并补充维度: (B, T, mels) -> (B, 1, mels, T)
             mel_in = mel_gt.transpose(1, 2).unsqueeze(1).to(device)
-            pitch_in = pitch_gt.to(device)
+            #pitch_in = pitch_gt.to(device)
             opec_gt = opec_gt.to(device)
             
-            info = {'mel': mel_in, 'action': pitch_in}
+            #info = {'mel': mel_in, 'action': pitch_in}
+            info = {'mel': mel_in}
             emb, preds, curve_pred = model(info, mode='train')
             
             # 1. Predictor 任务指标
@@ -250,19 +252,19 @@ def main():
     
     decoder = None
     if args.use_decoder:
-        decoder = Decoder(hidden_size=args.hidden_size, out_dim=1, expansion=args.decoder_expansion)
+        decoder = ConvNeXtDecoder(args.hidden_size, 1)
         
     projector = MLP(
         input_dim=args.hidden_size,
         output_dim=args.hidden_size,
-        hidden_dim=2048,
+        hidden_dim=args.hidden_size*4,
         norm_fn=nn.LayerNorm,
     )
 
     predictor_proj = MLP(
         input_dim=args.hidden_size,
         output_dim=args.hidden_size,
-        hidden_dim=2048,
+        hidden_dim=args.hidden_size*4,
         norm_fn=nn.LayerNorm,
     )
     
@@ -333,26 +335,27 @@ def main():
             global_step = saver.global_step
             
             mel_in = batch['aug_mel'].transpose(1, 2).unsqueeze(1).to(device)
-            pitch_in = batch['pitch'].to(device)
+            #pitch_in = batch['pitch'].to(device)
             opec_gt = batch['opec'].to(device)
             # 修正后的代码
-            log_pitch = (1 + pitch_in / 700).log()            # (B, T)
+            #log_pitch = (1 + pitch_in / 700).log()            # (B, T)
             # 如果 pitch_in 是 (B, T, 1)，可以先 squeeze(-1) 变成 (B, T)
-            if log_pitch.dim() == 3:
-                log_pitch = log_pitch.squeeze(-1)
-
+            #if log_pitch.dim() == 3:
+            #    log_pitch = log_pitch.squeeze(-1)
+            #
             # 计算一阶差分（沿时间轴）
-            delta_pitch = log_pitch[:, 1:] - log_pitch[:, :-1]  # (B, T-1)
-
+            #delta_pitch = log_pitch[:, 1:] - log_pitch[:, :-1]  # (B, T-1)
+            #
             # 补齐第一帧（可选：用0填充，或用原始第一帧值）
-            first_frame = torch.zeros_like(delta_pitch[:, :1])  # 第一帧补0，形状 (B, 1)
-            delta_pitch = torch.cat([first_frame, delta_pitch], dim=1)  # (B, T)
-
+            #first_frame = torch.zeros_like(delta_pitch[:, :1])  # 第一帧补0，形状 (B, 1)
+            #delta_pitch = torch.cat([first_frame, delta_pitch], dim=1)  # (B, T)
+            #
             # 恢复为三维以适应 Embedder 的输入要求 (B, T, 1)
-            delta_pitch = delta_pitch.unsqueeze(-1)              # (B, T, 1)
+            #delta_pitch = delta_pitch.unsqueeze(-1)              # (B, T, 1)
 
             # 然后传入 info
-            info = {'mel': mel_in, 'action': delta_pitch}
+            # info = {'mel': mel_in, 'action': delta_pitch}
+            info = {'mel': mel_in}
             
             optimizer.zero_grad()
             skip_steps = args.skip_steps  # 跳跃步数，可以设为超参数

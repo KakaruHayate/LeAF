@@ -271,7 +271,7 @@ class ARPredictor(nn.Module):
             dim_head,
             mlp_dim,
             dropout,
-            block_class=ConditionalBlock,
+            block_class=Block,
         )
 
     def forward(self, x, c):
